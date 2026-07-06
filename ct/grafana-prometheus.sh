@@ -23,7 +23,6 @@ function update_script() {
   check_container_storage
   check_container_resources
 
-  # Update Grafana if installed
   if dpkg -s grafana >/dev/null 2>&1; then
     if [[ -f /etc/apt/sources.list.d/grafana.list ]]; then
       msg_info "Updating Grafana"
@@ -37,10 +36,8 @@ function update_script() {
     msg_error "No Grafana installation found, skipping Grafana update."
   fi
 
-  # Update Prometheus if installed
   if [[ -f /etc/systemd/system/prometheus.service ]]; then
     msg_info "Updating Prometheus"
-    # Fetch latest Prometheus release (same pattern as community-scripts)
     RELEASE=$(curl -s https://api.github.com/repos/prometheus/prometheus/releases/latest \
       | grep "tag_name" | awk '{print substr($2, 3, length($2)-4) }')
 
@@ -71,10 +68,9 @@ start
 build_container
 description
 
-# Create install script on Proxmox host and push it into the new LXC
 monitor_script="/tmp/monitoring-install.sh"
 
-cat << 'EOF' > "$monitor_script"
+cat <<'EOF' > "$monitor_script"
 #!/usr/bin/env bash
 set -e
 
@@ -128,10 +124,10 @@ After=network-online.target
 User=prometheus
 Group=prometheus
 Type=simple
-ExecStart=/usr/local/bin/prometheus \\
-  --config.file=/etc/prometheus/prometheus.yml \\
-  --storage.tsdb.path=/var/lib/prometheus/ \\
-  --web.console.templates=/etc/prometheus/consoles \\
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/ \
+  --web.console.templates=/etc/prometheus/consoles \
   --web.console.libraries=/etc/prometheus/console_libraries
 
 [Install]
@@ -145,12 +141,10 @@ systemctl enable --now prometheus
 echo "Monitoring stack installation completed."
 EOF
 
-# Push the installer into the container and execute it
 pct push "$CTID" "$monitor_script" /root/monitoring-install.sh
 pct exec "$CTID" -- bash /root/monitoring-install.sh
 rm "$monitor_script"
 
-# Get container IP for access info
 IP=$(pct exec "$CTID" ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
 
 msg_ok "Completed successfully!\n"
