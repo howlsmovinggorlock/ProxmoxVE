@@ -1,95 +1,68 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
+# Installs Prowlarr, Sonarr, Radarr, Lidarr, and Seerr in one LXC.
+# Intended to be called by ct/arr-stack.sh through community-scripts build.func.
+set -eEuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-ARCH="$(dpkg --print-architecture)"
 
+ARCH="$(dpkg --print-architecture)"
 case "$ARCH" in
-  amd64) ARR_ARCH="linux-core-x64" ;;
-  arm64) ARR_ARCH="linux-core-arm64" ;;
-  *)
-    echo "Unsupported architecture: $ARCH"
-    exit 1
-    ;;
+  amd64) ASSET_ARCH="x64" ;;
+  arm64) ASSET_ARCH="arm64" ;;
+  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-install_deps() {
+log() { printf '\n==> %s\n' "$*"; }
+
+install_dependencies() {
+  log "Installing dependencies"
   apt-get update
-  apt-get install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    sqlite3 \
-    tzdata \
-    libicu-dev \
-    libcurl4 \
-    libssl3 \
-    libgssapi-krb5-2 \
-    libgdiplus \
-    libchromiumcontent1 \
-    mediainfo \
-    xmlstarlet
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl jq sqlite3 mediainfo tzdata git gnupg \
+    libicu-dev libcurl4 libssl3 libgssapi-krb5-2 libgdiplus
 }
 
-create_user() {
+create_media_user() {
+  if ! getent group media >/dev/null; then groupadd --gid 1000 media; fi
   if ! id media >/dev/null 2>&1; then
-    useradd \
-      --system \
-      --uid 1000 \
-      --gid users \
-      --home-dir /var/lib/media \
-      --create-home \
-      --shell /usr/sbin/nologin \
-      media
+    useradd --system --uid 1000 --gid media --home-dir /var/lib/media \
+      --create-home --shell /usr/sbin/nologin media
   fi
-
-  install -d -o media -g users -m 775 \
-    /data \
-    /data/torrents \
-    /data/usenet \
-    /data/media \
-    /data/media/tv \
-    /data/media/movies \
-    /data/media/music
+  install -d -o media -g media -m 0775 \
+    /data /data/torrents /data/usenet /data/media \
+    /data/media/tv /data/media/movies /data/media/music
 }
 
-latest_tag() {
-  local repo="$1"
-  curl -fsSL \
-    -H "Accept: application/vnd.github+json" \
+latest_arr_asset() {
+  local repo="$1" pattern="$2"
+  curl -fsSL -H 'Accept: application/vnd.github+json' \
     "https://api.github.com/repos/${repo}/releases/latest" \
-    | jq -r '.tag_name'
+    | jq -r --arg pattern "$pattern" \
+      '.assets[] | select(.name | test($pattern)) | .browser_download_url' \
+    | head -n1
 }
 
 install_arr() {
-  local app="$1"
-  local repo="$2"
-  local service="$3"
-  local port="$4"
-  local tag url archive tmpdir
+  local app="$1" repo="$2" service="$3"
+  local url archive tmp
+  url="$(latest_arr_asset "$repo" "linux-core-${ASSET_ARCH}\\.tar\\.gz$")"
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    echo "No ${app} linux-core-${ASSET_ARCH} release asset found." >&2
+    exit 1
+  fi
 
-  tag="$(latest_tag "$repo")"
-  url="https://github.com/${repo}/releases/download/${tag}/${app}.master.${ARR_ARCH}.tar.gz"
-
-  echo "Installing ${app} ${tag}"
-
+  log "Installing ${app}"
   systemctl stop "$service" 2>/dev/null || true
+  tmp="$(mktemp -d)"
+  archive="${tmp}/${app}.tar.gz"
+  curl -fL --retry 3 "$url" -o "$archive"
   rm -rf "/opt/${app}"
-
-  tmpdir="$(mktemp -d)"
-  archive="${tmpdir}/${app}.tar.gz"
-
-  curl -fL "$url" -o "$archive"
-  mkdir -p "/opt/${app}"
+  install -d -o media -g media -m 0775 "/opt/${app}" "/var/lib/${service}"
   tar -xzf "$archive" -C "/opt/${app}" --strip-components=1
-  rm -rf "$tmpdir"
+  rm -rf "$tmp"
+  chown -R media:media "/opt/${app}" "/var/lib/${service}"
+  chmod 0755 "/opt/${app}/${app}"
 
-  chown -R media:users "/opt/${app}"
-  chmod 775 "/opt/${app}"
-
-  install -d -o media -g users -m 775 "/var/lib/${app}"
-
-  cat > "/etc/systemd/system/${service}.service" <<EOF
+  cat >"/etc/systemd/system/${service}.service" <<EOF
 [Unit]
 Description=${app}
 After=network-online.target
@@ -97,9 +70,9 @@ Wants=network-online.target
 
 [Service]
 User=media
-Group=users
+Group=media
 Type=simple
-ExecStart=/opt/${app}/${app} -nobrowser -data=/var/lib/${app}/
+ExecStart=/opt/${app}/${app} -nobrowser -data=/var/lib/${service}/
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
@@ -108,44 +81,34 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable --now "$service"
+}
 
-  echo "${app} available on port ${port}"
+install_node() {
+  log "Installing Node.js 22"
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' \
+    >/etc/apt/sources.list.d/nodesource.list
+  apt-get update
+  apt-get install -y nodejs
+  corepack enable
 }
 
 install_seerr() {
-  local keyring="/usr/share/keyrings/nodesource.gpg"
-  local repo_file="/etc/apt/sources.list.d/nodesource.list"
-
-  echo "Installing Seerr"
-
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-    | gpg --dearmor -o "$keyring"
-
-  echo \
-    "deb [signed-by=${keyring}] https://deb.nodesource.com/node_22.x nodistro main" \
-    > "$repo_file"
-
-  apt-get update
-  apt-get install -y nodejs
-
-  install -d -o media -g users -m 775 /opt/seerr /var/lib/seerr
-
-  if [[ ! -d /opt/seerr/.git ]]; then
-    git clone --depth=1 https://github.com/seerr-team/seerr.git /opt/seerr
-  else
-    git -C /opt/seerr pull --ff-only
-  fi
-
+  log "Installing Seerr"
+  install_node
+  rm -rf /opt/seerr
+  git clone --depth=1 https://github.com/seerr-team/seerr.git /opt/seerr
+  install -d -o media -g media -m 0775 /var/lib/seerr
   cd /opt/seerr
-  npm ci --omit=dev
-  npm run build
+  corepack pnpm install --frozen-lockfile
+  corepack pnpm build
+  chown -R media:media /opt/seerr /var/lib/seerr
 
-  chown -R media:users /opt/seerr /var/lib/seerr
-
-  cat > /etc/systemd/system/seerr.service <<'EOF'
+  cat >/etc/systemd/system/seerr.service <<'EOF'
 [Unit]
 Description=Seerr
 After=network-online.target
@@ -153,38 +116,33 @@ Wants=network-online.target
 
 [Service]
 User=media
-Group=users
+Group=media
 Type=simple
 WorkingDirectory=/opt/seerr
 Environment=NODE_ENV=production
 Environment=PORT=5055
 Environment=CONFIG_DIRECTORY=/var/lib/seerr
-ExecStart=/usr/bin/npm start
+ExecStart=/usr/bin/corepack pnpm start
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable --now seerr
 }
 
 main() {
-  install_deps
-  create_user
-
-  install_arr "Prowlarr" "Prowlarr/Prowlarr" "prowlarr" "9696"
-  install_arr "Sonarr" "Sonarr/Sonarr" "sonarr" "8989"
-  install_arr "Radarr" "Radarr/Radarr" "radarr" "7878"
-  install_arr "Lidarr" "Lidarr/Lidarr" "lidarr" "8686"
-
-  apt-get install -y git jq
+  install_dependencies
+  create_media_user
+  install_arr Prowlarr Prowlarr/Prowlarr prowlarr
+  install_arr Sonarr Sonarr/Sonarr sonarr
+  install_arr Radarr Radarr/Radarr radarr
+  install_arr Lidarr Lidarr/Lidarr lidarr
   install_seerr
-
-  systemctl --no-pager --full status \
-    prowlarr sonarr radarr lidarr seerr || true
+  log "Installed services"
+  systemctl --no-pager --full status prowlarr sonarr radarr lidarr seerr || true
 }
 
 main "$@"
